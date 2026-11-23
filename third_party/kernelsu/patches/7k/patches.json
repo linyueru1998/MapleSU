@@ -524,6 +524,33 @@
       ],
       "compile_verified": false,
       "compile_note": "Source generation only; userland compilation and behavior verification await the sole validation owner."
+    },
+    {
+      "name": "0026-module-install-transaction.patch",
+      "sha256": "23545696208d6ed5bf77324406f5bde7e96e0f11e83b8519938fed6db5fce334",
+      "size": 22316,
+      "status": "implemented",
+      "summary": "Restore failed module pending generations and metadata, including boot recovery before execution",
+      "touches": [
+        "userspace/ksud/src/init_event.rs",
+        "userspace/ksud/src/installer.sh",
+        "userspace/ksud/src/module.rs",
+        "userspace/ksud/src/module_install_transaction.rs"
+      ]
+    },
+    {
+      "name": "0027-module-removal-transaction.patch",
+      "sha256": "1e691c3e162b8d422484380fa4f525cd92d8ce59bdc620d174d3d594c600678d",
+      "size": 60807,
+      "status": "implemented",
+      "summary": "Persist exact module removal intent, clean pending and live generations, and retain unfinished cleanup",
+      "touches": [
+        "userspace/ksud/src/hot_install.rs",
+        "userspace/ksud/src/metamodule.rs",
+        "userspace/ksud/src/module.rs",
+        "userspace/ksud/src/module_install_transaction.rs",
+        "userspace/ksud/src/module_removal_transaction.rs"
+      ]
     }
   ],
   "superseded": [

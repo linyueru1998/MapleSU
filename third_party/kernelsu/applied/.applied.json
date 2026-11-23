@@ -25,16 +25,18 @@
     "0022-boot-copy-rebuild.patch",
     "0023-boot-backup-optional.patch",
     "0024-boot-empty-origin-restore.patch",
-    "0025-target-kernel-kmi.patch"
+    "0025-target-kernel-kmi.patch",
+    "0026-module-install-transaction.patch",
+    "0027-module-removal-transaction.patch"
   ],
-  "aggregateSha256": "abe46d6c8f86d11e9bd844af68241f2af184aff5d75fe6eb22d7950fd20cfb4c",
-  "seriesSha256": "467f4bc2768a67857d2bf26a0c42ff7c66b395768f802d4e2959317de488a6fa",
-  "appliedAt": "2026-11-17T13:33:40Z",
+  "aggregateSha256": "8c4378727233580fa58b33ddc9de76df8e8fd2bdaa199144a97f498bf73735ed",
+  "seriesSha256": "b33042f04e7e19b2f85c305bc82eaa63589bf74ceb5094d27dc84e0599fcd9e3",
+  "appliedAt": "2026-11-23T04:37:08Z",
   "uapiVersion": 7,
   "uapiSyncTargets": [
     "kernel/include/uapi",
     "manager/app/src/main/cpp/uapi"
   ],
-  "treeSha256": "bd6d70685ec7cef4bf9ad91b11b7fb7e5ef08bd6ef1c7a82a07beb22188a8c81",
-  "fileCount": 839
+  "treeSha256": "63f27aad723ca5aad14fc53e84688305dd3d9ba8c0325a8383b2e34e259cbb76",
+  "fileCount": 841
 }

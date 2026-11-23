@@ -25,3 +25,5 @@
 0023-boot-backup-optional.patch
 0024-boot-empty-origin-restore.patch
 0025-target-kernel-kmi.patch
+0026-module-install-transaction.patch
+0027-module-removal-transaction.patch

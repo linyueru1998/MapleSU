@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import ksu_common as C
+from gen_patches import PATCHES
 
 EXIT_OK = 0
 EXIT_INPUT = 2
@@ -110,6 +111,8 @@ def build(root: Path, clean: bool, check_only: bool) -> int:
         series = C.read_series(root / "patches" / "7k" / "series")
     except C.KsuError as exc:
         fail(EXIT_INPUT, str(exc))
+    if series != [spec["name"] for spec in PATCHES]:
+        fail(EXIT_INPUT, "patch series differs from gen_patches.py; regenerate the patch series")
 
     if check_only:
         if not applied.is_dir():

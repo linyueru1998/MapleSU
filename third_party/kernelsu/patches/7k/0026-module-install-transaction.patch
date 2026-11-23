@@ -1,0 +1,557 @@
+diff --git a/userspace/ksud/src/init_event.rs b/userspace/ksud/src/init_event.rs
+index 306dff3..88b2759 100644
+--- a/userspace/ksud/src/init_event.rs
++++ b/userspace/ksud/src/init_event.rs
+@@ -50,6 +50,9 @@ pub fn on_post_fs_data() -> Result<()> {
+     assets::ensure_binaries(true).with_context(|| "Failed to extract bin assets")?;
+ 
+     crate::hot_install::clean_trash();
++    if let Err(e) = crate::module::recover_module_installations() {
++        warn!("module installation recovery failed: {e:#}");
++    }
+ 
+     // if we are in safe mode, we should disable all modules
+     if safe_mode {
+diff --git a/userspace/ksud/src/installer.sh b/userspace/ksud/src/installer.sh
+index 30ef399..9432544 100644
+--- a/userspace/ksud/src/installer.sh
++++ b/userspace/ksud/src/installer.sh
+@@ -448,10 +448,12 @@ install_module() {
+   handle_partition odm
+ 
+   if $BOOTMODE; then
+-    mktouch $NVBASE/modules/$MODID/update
+-    rm -rf $NVBASE/modules/$MODID/remove 2>/dev/null
+-    rm -rf $NVBASE/modules/$MODID/disable 2>/dev/null
+-    cp -af $MODPATH/module.prop $NVBASE/modules/$MODID/module.prop
++    if [ "$KSUD_MANAGED_INSTALL" != "1" ]; then
++      mktouch $NVBASE/modules/$MODID/update
++      rm -rf $NVBASE/modules/$MODID/remove 2>/dev/null
++      rm -rf $NVBASE/modules/$MODID/disable 2>/dev/null
++      cp -af $MODPATH/module.prop $NVBASE/modules/$MODID/module.prop
++    fi
+ 
+     # Tell ksud to apply the module right away
+     if [ "$MODULE_HOT_INSTALL_REQUEST" = "true" ]; then
+@@ -484,7 +486,7 @@ install_module() {
+ [ -z $BOOTMODE ] && BOOTMODE=false
+ 
+ NVBASE=/data/adb
+-TMPDIR=/dev/tmp
++TMPDIR=${KSUD_INSTALL_TMPDIR:-/dev/tmp}
+ POSTFSDATAD=$NVBASE/post-fs-data.d
+ SERVICED=$NVBASE/service.d
+ 
+diff --git a/userspace/ksud/src/module.rs b/userspace/ksud/src/module.rs
+index a0665f8..c20860a 100644
+--- a/userspace/ksud/src/module.rs
++++ b/userspace/ksud/src/module.rs
+@@ -24,15 +24,18 @@ use std::{
+     time::Instant,
+ };
+ use std::{
+-    fs::{copy, rename},
++    fs::rename,
+     io::Write,
+ };
+ use zip_extensions::inflate::zip_extract::zip_extract_file_to_memory;
+ 
+-use crate::defs::{MODULE_DIR, MODULE_UPDATE_DIR, UPDATE_FILE_NAME};
++use crate::defs::{MODULE_DIR, MODULE_UPDATE_DIR};
+ use crate::module::ModuleType::{Active, All};
+ use std::os::unix::{prelude::PermissionsExt, process::CommandExt};
+ 
++#[path = "module_install_transaction.rs"]
++mod install_transaction;
++
+ const INSTALLER_CONTENT: &str = include_str!("./installer.sh");
+ const INSTALL_MODULE_SCRIPT: &str = concatcp!(
+     INSTALLER_CONTENT,
+@@ -94,7 +97,9 @@ pub fn get_common_script_envs(module_id: Option<&str>) -> Vec<(&'static str, Str
+     envs
+ }
+ 
+-fn exec_install_script(module_file: &str, is_metamodule: bool, module_id: &str) -> Result<()> {
++fn exec_install_script(
++    module_file: &str, is_metamodule: bool, module_id: &str, temporary_dir: &Path,
++) -> Result<()> {
+     let realpath = std::fs::canonicalize(module_file)
+         .with_context(|| format!("realpath: {module_file} failed"))?;
+ 
+@@ -102,10 +107,25 @@ fn exec_install_script(module_file: &str, is_metamodule: bool, module_id: &str)
+     let install_script =
+         metamodule::get_install_script(is_metamodule, INSTALLER_CONTENT, INSTALL_MODULE_SCRIPT)?;
+ 
+-    let result = Command::new(assets::BUSYBOX_PATH)
++    let parent = std::process::id() as libc::pid_t;
++    let mut command = Command::new(assets::BUSYBOX_PATH);
++    unsafe {
++        command.pre_exec(move || {
++            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
++                return Err(std::io::Error::last_os_error());
++            }
++            if libc::getppid() != parent {
++                return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
++            }
++            Ok(())
++        });
++    }
++    let result = command
+         .args(["sh", "-c", &install_script])
+         .envs(get_common_script_envs(Some(module_id)))
+         .env("OUTFD", "1")
++        .env("KSUD_MANAGED_INSTALL", "1")
++        .env("KSUD_INSTALL_TMPDIR", temporary_dir)
+         .env("ZIPFILE", realpath)
+         .status()?;
+     ensure!(result.success(), "Failed to install module script");
+@@ -145,6 +165,9 @@ pub fn foreach_module(
+             continue;
+         }
+ 
++        if install_transaction::skip_uncommitted(&path, module_type == ModuleType::Updated) {
++            continue;
++        }
+         if module_type == Active && path.join(defs::DISABLE_FILE_NAME).exists() {
+             info!("{} is disabled, skip", path.display());
+             continue;
+@@ -553,6 +576,11 @@ fn next_boot_modules() -> BTreeMap<String, PathBuf> {
+             let Some(id) = module_path.file_name().and_then(|s| s.to_str()) else {
+                 continue;
+             };
++            if install_transaction::skip_uncommitted(
++                &module_path, src_dir == defs::MODULE_UPDATE_DIR,
++            ) {
++                continue;
++            }
+             let id = id.to_string();
+             if module_path.join(defs::DISABLE_FILE_NAME).exists()
+                 || module_path.join(defs::REMOVE_FILE_NAME).exists()
+@@ -648,7 +676,12 @@ pub fn regenerate_preinit() -> Result<()> {
+     rc.and(preinit)
+ }
+ 
++pub(super) fn recover_module_installations() -> Result<()> {
++    install_transaction::recover_before_boot()
++}
++
+ pub fn handle_updated_modules() -> Result<()> {
++    recover_module_installations()?;
+     let modules_root = Path::new(MODULE_DIR);
+     foreach_module(ModuleType::Updated, |updated_module| {
+         if !updated_module.is_dir() {
+@@ -786,6 +819,8 @@ fn install_module_to_system(zip: &str) -> Result<String> {
+     ensure_dir_exists(defs::MODULE_UPDATE_DIR)?;
+     setsyscon(defs::MODULE_UPDATE_DIR)?;
+ 
++    let mut transaction = install_transaction::InstallTransaction::begin(module_id)?;
++
+     // Prepare target directory
+     println!("- Installing to {}", updated_dir.display());
+     ensure_clean_dir(&updated_dir)?;
+@@ -808,7 +843,9 @@ fn install_module_to_system(zip: &str) -> Result<String> {
+ 
+     // Execute install script
+     println!("- Running module installer");
+-    exec_install_script(zip, is_metamodule, module_id)?;
++    exec_install_script(zip, is_metamodule, module_id, &transaction.temporary_dir())?;
++    transaction.publish_metadata(is_metamodule)?;
++    transaction.commit()?;
+ 
+     if let Some(request) = hot_install::take_request(&updated_dir)
+         && hot_install::apply(module_id, is_metamodule, &request)
+@@ -818,22 +855,6 @@ fn install_module_to_system(zip: &str) -> Result<String> {
+         return Ok(module_id.to_owned());
+     }
+ 
+-    let module_dir = Path::new(MODULE_DIR).join(module_id);
+-    // A metamodule doing its own hot install may have moved the marker into the live dir
+-    std::fs::remove_file(module_dir.join(defs::HOT_INSTALL_MARKER)).ok();
+-    ensure_dir_exists(&module_dir)?;
+-    copy(
+-        updated_dir.join("module.prop"),
+-        module_dir.join("module.prop"),
+-    )?;
+-    ensure_file_exists(module_dir.join(UPDATE_FILE_NAME))?;
+-
+-    // Create symlink for metamodule
+-    if is_metamodule {
+-        println!("- Creating metamodule symlink");
+-        metamodule::ensure_symlink(&module_dir)?;
+-    }
+-
+     println!("- Module installed successfully!");
+     info!("Module {module_id} installed successfully!");
+ 
+@@ -1066,7 +1087,9 @@ fn list_module(path: &str) -> Vec<HashMap<String, String>> {
+         let path = entry.path();
+         info!("path: {}", path.display());
+ 
+-        if !path.join("module.prop").exists() {
++        if install_transaction::skip_uncommitted(&path, false)
++            || !path.join("module.prop").exists()
++        {
+             continue;
+         }
+ 
+diff --git a/userspace/ksud/src/module_install_transaction.rs b/userspace/ksud/src/module_install_transaction.rs
+new file mode 100644
+index 0000000..3eca9d0
+--- /dev/null
++++ b/userspace/ksud/src/module_install_transaction.rs
+@@ -0,0 +1,355 @@
++use crate::{defs, metamodule, utils::{ensure_dir_exists, ensure_file_exists}};
++use anyhow::{Context, Result, bail, ensure};
++use serde_json::{Value, json};
++use std::{
++    fs::{self, DirBuilder, File, OpenOptions},
++    io::{self, Read, Write},
++    os::{fd::AsRawFd, unix::fs::{DirBuilderExt, OpenOptionsExt}},
++    path::{Path, PathBuf},
++};
++
++pub(super) struct InstallTransaction {
++    directory: PathBuf,
++    _lock: File,
++    record: Value,
++    committed: bool,
++    commit_visible: bool,
++    record_durable: bool,
++}
++
++fn root() -> PathBuf {
++    Path::new(defs::WORKING_DIR).join(".module-install")
++}
++
++fn sync_dir(path: &Path) -> Result<()> {
++    File::open(path)?.sync_all()?;
++    Ok(())
++}
++
++fn sync_existing_parent(path: &Path) -> Result<()> {
++    let mut parent = path.parent().context("Missing parent directory")?;
++    loop {
++        match fs::symlink_metadata(parent) {
++            Ok(_) => return sync_dir(parent),
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                parent = parent.parent().context("Missing existing parent directory")?;
++            }
++            Err(error) => return Err(error.into()),
++        }
++    }
++}
++
++fn sync_tree(path: &Path) -> Result<()> {
++    for entry in fs::read_dir(path)? {
++        let entry = entry?;
++        let kind = entry.file_type()?;
++        if kind.is_dir() {
++            sync_tree(&entry.path())?;
++        } else if kind.is_file() {
++            OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
++                .open(entry.path())?.sync_all()?;
++        }
++    }
++    sync_dir(path)
++}
++
++fn remove_entry(path: &Path) -> io::Result<()> {
++    match fs::symlink_metadata(path) {
++        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
++        Ok(_) => fs::remove_file(path),
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
++        Err(error) => Err(error),
++    }
++}
++
++fn private_root() -> Result<PathBuf> {
++    let path = root();
++    match DirBuilder::new().mode(0o700).create(&path) {
++        Ok(()) => sync_dir(Path::new(defs::WORKING_DIR))?,
++        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
++            ensure!(fs::symlink_metadata(&path)?.is_dir(), "Invalid installation state directory");
++        }
++        Err(error) => return Err(error.into()),
++    }
++    Ok(path)
++}
++
++fn lock(module_id: &str, wait: bool) -> Result<Option<File>> {
++    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
++        .mode(0o600).custom_flags(libc::O_NOFOLLOW)
++        .open(private_root()?.join(format!(".lock-{module_id}")))?;
++    loop {
++        let flags = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
++        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
++            return Ok(Some(file));
++        }
++        let error = io::Error::last_os_error();
++        if !wait && error.kind() == io::ErrorKind::WouldBlock {
++            return Ok(None);
++        }
++        if error.kind() != io::ErrorKind::Interrupted {
++            return Err(error.into());
++        }
++    }
++}
++
++fn metadata_path(module_id: &str, name: &str) -> Result<PathBuf> {
++    match name {
++        "module.prop" | "update" | "remove" | "disable" | ".ksu_hot_install" => {
++            Ok(Path::new(defs::MODULE_DIR).join(module_id).join(name))
++        }
++        "metamodule" => Ok(PathBuf::from(defs::METAMODULE_DIR.trim_end_matches('/'))),
++        _ => bail!("Invalid installation metadata entry"),
++    }
++}
++
++fn read_record(directory: &Path, module_id: &str) -> Result<Option<Value>> {
++    let text = match fs::read(directory.join("record")) {
++        Ok(text) => text,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
++        Err(error) => return Err(error.into()),
++    };
++    let record: Value = serde_json::from_slice(&text)?;
++    ensure!(record["version"] == 1 && record["id"] == module_id,
++        "Invalid installation transaction identity");
++    ensure!(record["generation"].as_str().is_some_and(|value|
++        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
++        "Invalid installation transaction generation");
++    ensure!(matches!(record["phase"].as_str(), Some("preparing" | "committed")),
++        "Invalid installation transaction phase");
++    ensure!(record["oldPending"].is_boolean() && record["createdLive"].is_boolean()
++        && record["entries"].is_array(), "Invalid installation transaction state");
++    for entry in record["entries"].as_array().context("Missing metadata intents")? {
++        metadata_path(module_id, entry["name"].as_str().context("Missing entry name")?)?;
++        ensure!(entry["existed"].is_boolean(), "Invalid metadata intent");
++    }
++    Ok(Some(record))
++}
++
++fn restore(directory: &Path, record: &Value) -> Result<()> {
++    let module_id = record["id"].as_str().context("Missing module identity")?;
++    let pending = Path::new(defs::MODULE_UPDATE_DIR).join(module_id);
++    let old_pending = directory.join("pending");
++    if fs::symlink_metadata(&old_pending).is_ok() {
++        remove_entry(&pending)?;
++        fs::rename(&old_pending, &pending)?;
++        sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++        sync_dir(directory)?;
++    } else if record["oldPending"] == false {
++        remove_entry(&pending)?;
++        sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++    }
++    let entries = record["entries"].as_array().context("Missing metadata intents")?;
++    for (index, entry) in entries.iter().enumerate().rev() {
++        let path = metadata_path(module_id, entry["name"].as_str().context("Missing entry name")?)?;
++        let saved = directory.join(format!("entry-{index}"));
++        if fs::symlink_metadata(&saved).is_ok() {
++            remove_entry(&path)?;
++            fs::rename(&saved, &path)?;
++        } else if entry["existed"] == false {
++            remove_entry(&path)?;
++        }
++        sync_existing_parent(&path)?;
++        sync_dir(directory)?;
++    }
++    if record["createdLive"] == true {
++        match fs::remove_dir(Path::new(defs::MODULE_DIR).join(module_id)) {
++            Ok(()) => {}
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => return Err(error.into()),
++        }
++        sync_dir(Path::new(defs::MODULE_DIR))?;
++    }
++    Ok(())
++}
++
++fn recover(directory: &Path, module_id: &str) -> Result<()> {
++    if !directory.try_exists()? { return Ok(()); }
++    let record = read_record(directory, module_id)?;
++    let rollback = record.as_ref().is_some_and(|record| record["phase"] != "committed");
++    if rollback {
++        restore(directory, record.as_ref().context("Missing recovery record")?)?;
++    }
++    fs::remove_dir_all(directory)?;
++    sync_dir(&root())?;
++    if rollback {
++        let _ = writeln!(io::stderr(), "- Failed installation of {module_id} rolled back");
++    }
++    Ok(())
++}
++
++pub(super) fn recover_before_boot() -> Result<()> {
++    let entries = match fs::read_dir(root()) {
++        Ok(entries) => entries,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
++        Err(error) => return Err(error.into()),
++    };
++    for entry in entries {
++        let entry = entry?;
++        if !entry.file_type()?.is_dir() { continue; }
++        let module_id = entry.file_name().to_string_lossy().into_owned();
++        super::validate_module_id(&module_id)?;
++        let Some(_lock) = lock(&module_id, false)? else {
++            continue;
++        };
++        if let Err(error) = recover(&entry.path(), &module_id) {
++            log::warn!("Module {module_id} installation recovery: {error:#}");
++        }
++    }
++    Ok(())
++}
++
++pub(super) fn skip_uncommitted(path: &Path, pending: bool) -> bool {
++    let Some(module_id) = path.file_name().and_then(|name| name.to_str()) else {
++        return true;
++    };
++    match read_record(&root().join(module_id), module_id) {
++        Ok(Some(record)) => record["phase"] != "committed"
++            && (pending || record["createdLive"] == true),
++        Ok(None) => false,
++        Err(error) => {
++            log::warn!("Module {module_id} installation state unreadable: {error:#}");
++            true
++        }
++    }
++}
++
++impl InstallTransaction {
++    pub(super) fn begin(module_id: &str) -> Result<Self> {
++        let lock = lock(module_id, true)?.context("Missing installation lock")?;
++        let directory = root().join(module_id);
++        recover(&directory, module_id)?;
++        let mut random = [0u8; 16];
++        File::open("/dev/urandom")?.read_exact(&mut random)?;
++        let generation: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
++        let old_pending = Path::new(defs::MODULE_UPDATE_DIR).join(module_id);
++        let pending_existed = match fs::symlink_metadata(&old_pending) {
++            Ok(_) => true,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
++            Err(error) => return Err(error.into()),
++        };
++        DirBuilder::new().mode(0o700).create(&directory)?;
++        let mut transaction = Self {
++            directory, _lock: lock, committed: false, commit_visible: false, record_durable: false,
++            record: json!({"version":1,"id":module_id,"generation":generation,
++                "phase":"preparing","oldPending":pending_existed,"createdLive":false,"entries":[]}),
++        };
++        transaction.persist()?;
++        sync_dir(&root())?;
++        transaction.record_durable = true;
++        if pending_existed {
++            fs::rename(&old_pending, transaction.directory.join("pending"))?;
++            sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++            sync_dir(&transaction.directory)?;
++        }
++        Ok(transaction)
++    }
++
++    fn persist(&mut self) -> Result<()> {
++        let temporary = self.directory.join("record.tmp");
++        let mut file = OpenOptions::new().write(true).create(true).truncate(true)
++            .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temporary)?;
++        serde_json::to_writer(&mut file, &self.record)?;
++        file.sync_all()?;
++        fs::rename(temporary, self.directory.join("record"))?;
++        if self.record["phase"] == "committed" {
++            self.commit_visible = true;
++        }
++        sync_dir(&self.directory)
++    }
++
++    pub(super) fn temporary_dir(&self) -> PathBuf {
++        self.directory.join("tmp")
++    }
++
++    fn save_entry(&mut self, name: &str) -> Result<()> {
++        let module_id = self.record["id"].as_str().context("Missing module identity")?;
++        let path = metadata_path(module_id, name)?;
++        let existed = match fs::symlink_metadata(&path) {
++            Ok(_) => true,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
++            Err(error) => return Err(error.into()),
++        };
++        let entries = self.record["entries"].as_array_mut().context("Missing metadata intents")?;
++        let index = entries.len();
++        entries.push(json!({"name":name,"existed":existed}));
++        self.persist()?;
++        if existed {
++            fs::rename(&path, self.directory.join(format!("entry-{index}")))?;
++            sync_dir(path.parent().context("Missing metadata parent")?)?;
++            sync_dir(&self.directory)?;
++        }
++        Ok(())
++    }
++
++    pub(super) fn publish_metadata(&mut self, is_metamodule: bool) -> Result<()> {
++        let module_id = self.record["id"].as_str().context("Missing module identity")?.to_owned();
++        let live = Path::new(defs::MODULE_DIR).join(&module_id);
++        self.record["createdLive"] = match fs::symlink_metadata(&live) {
++            Ok(_) => false.into(),
++            Err(error) if error.kind() == io::ErrorKind::NotFound => true.into(),
++            Err(error) => return Err(error.into()),
++        };
++        self.persist()?;
++        ensure_dir_exists(&live)?;
++        for name in ["module.prop", defs::UPDATE_FILE_NAME, defs::REMOVE_FILE_NAME,
++            defs::DISABLE_FILE_NAME, defs::HOT_INSTALL_MARKER]
++        {
++            self.save_entry(name)?;
++        }
++        fs::copy(Path::new(defs::MODULE_UPDATE_DIR).join(&module_id).join("module.prop"),
++            live.join("module.prop"))?;
++        File::open(live.join("module.prop"))?.sync_all()?;
++        ensure_file_exists(live.join(defs::UPDATE_FILE_NAME))?;
++        if is_metamodule {
++            self.save_entry("metamodule")?;
++            metamodule::ensure_symlink(&live)?;
++            sync_dir(Path::new(defs::ADB_DIR))?;
++        }
++        sync_dir(&live)?;
++        sync_dir(Path::new(defs::MODULE_DIR))?;
++        Ok(())
++    }
++
++    pub(super) fn commit(&mut self) -> Result<()> {
++        sync_tree(&Path::new(defs::MODULE_UPDATE_DIR).join(
++            self.record["id"].as_str().context("Missing module identity")?))?;
++        sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++        self.record["phase"] = "committed".into();
++        self.persist()?;
++        self.committed = true;
++        Ok(())
++    }
++}
++
++impl Drop for InstallTransaction {
++    fn drop(&mut self) {
++        if !self.record_durable {
++            let _ = fs::remove_dir_all(&self.directory);
++            return;
++        }
++        if self.commit_visible && !self.committed {
++            let _ = writeln!(io::stderr(), "! Module commit receipt unconfirmed; retained {}", self.directory.display());
++            return;
++        }
++        if !self.committed {
++            self.record["phase"] = "preparing".into();
++            let result = self.persist().and_then(|()| restore(&self.directory, &self.record));
++            if let Err(error) = result {
++                let _ = writeln!(io::stderr(), "! Module rollback incomplete: {error:#}; retained {}", self.directory.display());
++                return;
++            }
++        }
++        let cleanup = fs::remove_dir_all(&self.directory).map_err(anyhow::Error::from)
++            .and_then(|()| sync_dir(&root()));
++        match cleanup {
++            Ok(()) if !self.committed => {
++                let _ = writeln!(io::stderr(), "- Failed installation of {} rolled back", self.record["id"]);
++            }
++            Ok(()) => {}
++            Err(error) => {
++                let _ = writeln!(io::stderr(), "! Module transaction cleanup: {error:#}");
++            }
++        }
++    }
++}

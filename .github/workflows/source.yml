@@ -28,6 +28,8 @@ jobs:
           python-version: '3.12'
       - name: Verify extractor dependency files
         run: python jailbreak-providers/ghostlock/build_extractor.py --verify-only
+      - name: Verify Normal patch definitions and exported module sources
+        run: python -m unittest discover -s tools/tests -p "test_ksu_source.py" -v
       - run: python tools/check_host.py
       - run: python -m pip install -r requirements-native.txt
       - name: Verify native module archive compatibility

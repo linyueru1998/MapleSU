@@ -1,0 +1,1384 @@
+diff --git a/userspace/ksud/src/hot_install.rs b/userspace/ksud/src/hot_install.rs
+index 32c0520..195da5f 100644
+--- a/userspace/ksud/src/hot_install.rs
++++ b/userspace/ksud/src/hot_install.rs
+@@ -94,6 +94,15 @@ fn stash(live_dir: &Path, module_id: &str) -> Result<PathBuf> {
+     Ok(target)
+ }
+ 
++fn notify_live_change(module_id: &str) {
++    use std::io::Write;
++    let Ok(nonce) = std::env::var("KSUD_MODULE_LIVE_EVENT") else { return; };
++    if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++        return;
++    }
++    let _ = writeln!(std::io::stderr(), "__MAPLESU_MODULE_LIVE_V1__{nonce}:{module_id}");
++}
++
+ fn swap(module_id: &str) -> Result<()> {
+     let staged_dir = Path::new(defs::MODULE_UPDATE_DIR).join(module_id);
+     let live_dir = Path::new(defs::MODULE_DIR).join(module_id);
+@@ -110,20 +119,30 @@ fn swap(module_id: &str) -> Result<()> {
+             && let Err(e) = rename(&old, &live_dir)
+         {
+             warn!("Failed to restore {}: {e}", live_dir.display());
++            notify_live_change(module_id);
+         }
+         return Err(e).with_context(|| format!("Failed to move {}", staged_dir.display()));
+     }
++    notify_live_change(module_id);
+     Ok(())
+ }
+ 
+ /// Try to apply the staged module right away. Returns false if the caller should fall back to
+ /// the regular update-on-reboot path.
+-pub fn apply(module_id: &str, is_metamodule: bool, request: &Request) -> bool {
++pub fn apply(
++    module_id: &str,
++    is_metamodule: bool,
++    request: &Request,
++    metadata_guard: Option<std::fs::File>,
++) -> bool {
+     println!("- Hot install requested");
+ 
+-    let run_script = match check(module_id, is_metamodule, request)
+-        .and_then(|script| swap(module_id).map(|()| script))
+-    {
++    let result = {
++        let _metadata = metadata_guard;
++        check(module_id, is_metamodule, request)
++            .and_then(|script| swap(module_id).map(|()| script))
++    };
++    let run_script = match result {
+         Ok(script) => script,
+         Err(e) => {
+             println!("- Hot install skipped: {e:#}");
+@@ -167,7 +186,7 @@ pub fn apply(module_id: &str, is_metamodule: bool, request: &Request) -> bool {
+             |command| {
+                 // Output goes to the installer's pipe, which the manager closes once the install
+                 // ends; ignore SIGPIPE so background processes started here keep running
+-                command.stdin(Stdio::null());
++                command.env_remove("KSUD_MODULE_LIVE_EVENT").stdin(Stdio::null());
+                 unsafe {
+                     command.pre_exec(|| {
+                         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+diff --git a/userspace/ksud/src/metamodule.rs b/userspace/ksud/src/metamodule.rs
+index a807330..452de7f 100644
+--- a/userspace/ksud/src/metamodule.rs
++++ b/userspace/ksud/src/metamodule.rs
+@@ -239,6 +239,7 @@ pub fn exec_metauninstall_script(module_id: &str) -> Result<()> {
+             get_metamodule_id().as_deref(),
+         ))
+         .env("MODULE_ID", module_id)
++        .env("KSUD_REMOVAL_CALLBACK_IDS", crate::module::removal_callback_ancestry(module_id))
+         .status()?;
+ 
+     ensure!(
+diff --git a/userspace/ksud/src/module.rs b/userspace/ksud/src/module.rs
+index c20860a..40730c2 100644
+--- a/userspace/ksud/src/module.rs
++++ b/userspace/ksud/src/module.rs
+@@ -35,6 +35,9 @@ use std::os::unix::{prelude::PermissionsExt, process::CommandExt};
+ 
+ #[path = "module_install_transaction.rs"]
+ mod install_transaction;
++use install_transaction::metadata_lock;
++#[path = "module_removal_transaction.rs"]
++mod removal_transaction;
+ 
+ const INSTALLER_CONTENT: &str = include_str!("./installer.sh");
+ const INSTALL_MODULE_SCRIPT: &str = concatcp!(
+@@ -125,6 +128,7 @@ fn exec_install_script(
+         .envs(get_common_script_envs(Some(module_id)))
+         .env("OUTFD", "1")
+         .env("KSUD_MANAGED_INSTALL", "1")
++        .env_remove("KSUD_MODULE_LIVE_EVENT")
+         .env("KSUD_INSTALL_TMPDIR", temporary_dir)
+         .env("ZIPFILE", realpath)
+         .status()?;
+@@ -172,7 +176,7 @@ pub fn foreach_module(
+             info!("{} is disabled, skip", path.display());
+             continue;
+         }
+-        if module_type == Active && path.join(defs::REMOVE_FILE_NAME).exists() {
++        if module_type == Active && removal_transaction::is_removed(&path) {
+             warn!("{} is removed, skip", path.display());
+             continue;
+         }
+@@ -444,61 +448,53 @@ pub fn load_system_prop() -> Result<()> {
+ }
+ 
+ pub fn prune_modules() -> Result<()> {
++    let mut ids = removal_transaction::pending_ids()?;
+     foreach_module(All, |module| {
+-        if !module.join(defs::REMOVE_FILE_NAME).exists() {
+-            return Ok(());
+-        }
+-
+-        info!("remove module: {}", module.display());
+-
+-        // Execute metamodule's metauninstall.sh first
+-        let module_id = module.file_name().and_then(|n| n.to_str()).unwrap_or("");
+-
+-        // Check if this is a metamodule
+-        let is_metamodule =
+-            read_module_prop(module).is_ok_and(|props| metamodule::is_metamodule(&props));
+-
+-        if is_metamodule {
+-            info!("Removing metamodule symlink");
+-            if let Err(e) = metamodule::remove_symlink() {
+-                warn!("Failed to remove metamodule symlink: {e}");
+-            }
+-        } else if let Err(e) = metamodule::exec_metauninstall_script(module_id) {
+-            warn!("Failed to exec metamodule uninstall for {module_id}: {e}");
+-        }
+-
+-        // Then execute module's own uninstall.sh
+-        let uninstaller = module.join("uninstall.sh");
+-        if uninstaller.exists()
+-            && let Err(e) = exec_script(uninstaller, ScriptWait::Forever)
++        if removal_transaction::is_removed(module)
++            && let Some(id) = module.file_name().and_then(|name| name.to_str())
+         {
+-            warn!("Failed to exec uninstaller: {e}");
+-        }
+-
+-        // Clear module configs before removing module directory
+-        if let Err(e) = crate::module_config::clear_module_configs(module_id) {
+-            warn!("Failed to clear configs for {module_id}: {e}");
++            ids.insert(id.to_owned());
+         }
+-
+-        // Finally remove the module directory
+-        if let Err(e) = remove_dir_all(module) {
+-            warn!("Failed to remove {}: {e}", module.display());
+-        }
+-
+         Ok(())
+     })?;
+ 
+-    // collect remaining modules, if none, clean up metamodule record
++    let mut first_error = None;
++    for id in ids {
++        let result = (|| -> Result<()> {
++            let Some(_lock) = install_transaction::mutation_lock(&id, false)? else {
++                info!("Module {id} operation in progress, skip removal this time");
++                return Ok(());
++            };
++            let Some(mut removal) = removal_transaction::Removal::open(&id, false)? else {
++                return Ok(());
++            };
++            info!("remove module: {id}");
++            removal.run_callbacks()?;
++            let _metadata = metadata_lock(&id)?;
++            removal.remove()
++        })();
++        if let Err(error) = result {
++            warn!("Failed to remove module {id}: {error:#}");
++            if first_error.is_none() { first_error = Some(error); }
++        }
++    }
++    if let Some(error) = first_error { return Err(error); }
++
+     let remaining_modules: Vec<_> = std::fs::read_dir(defs::MODULE_DIR)?
+         .filter_map(std::result::Result::ok)
+         .filter(|entry| entry.path().join("module.prop").exists())
+         .collect();
++    if remaining_modules.is_empty() { info!("no remaining modules."); }
++    Ok(())
++}
+ 
+-    if remaining_modules.is_empty() {
+-        info!("no remaining modules.");
++pub(super) fn removal_callback_ancestry(module_id: &str) -> String {
++    let mut held = std::env::var("KSUD_REMOVAL_CALLBACK_IDS").unwrap_or_default();
++    if !held.split(':').any(|id| id == module_id) {
++        if !held.is_empty() { held.push(':'); }
++        held.push_str(module_id);
+     }
+-
+-    Ok(())
++    held
+ }
+ 
+ // Kernels before this UAPI only look for modules.rc under /metadata/watchdog and /metadata.
+@@ -584,6 +580,7 @@ fn next_boot_modules() -> BTreeMap<String, PathBuf> {
+             let id = id.to_string();
+             if module_path.join(defs::DISABLE_FILE_NAME).exists()
+                 || module_path.join(defs::REMOVE_FILE_NAME).exists()
++                || removal_transaction::is_removed(&Path::new(MODULE_DIR).join(&id))
+             {
+                 modules.insert(id, None);
+                 continue;
+@@ -683,36 +680,36 @@ pub(super) fn recover_module_installations() -> Result<()> {
+ pub fn handle_updated_modules() -> Result<()> {
+     recover_module_installations()?;
+     let modules_root = Path::new(MODULE_DIR);
++    let mut first_error = None;
+     foreach_module(ModuleType::Updated, |updated_module| {
+-        if !updated_module.is_dir() {
++        let Some(id) = updated_module.file_name().and_then(|name| name.to_str()) else {
+             return Ok(());
+-        }
+-
+-        if let Some(name) = updated_module.file_name() {
+-            let module_dir = modules_root.join(name);
+-            let mut disabled = false;
+-            let mut removed = false;
+-            if module_dir.exists() {
+-                // If the old module is disabled, we need to also disable the new one
+-                disabled = module_dir.join(defs::DISABLE_FILE_NAME).exists();
+-                removed = module_dir.join(defs::REMOVE_FILE_NAME).exists();
+-                remove_dir_all(&module_dir)?;
++        };
++        let result = (|| -> Result<()> {
++            validate_module_id(id)?;
++            let Some(_lock) = install_transaction::mutation_lock(id, false)? else {
++                info!("Module {id} operation in progress, skip update this time");
++                return Ok(());
++            };
++            let _metadata = metadata_lock(id)?;
++            let module_dir = modules_root.join(id);
++            if removal_transaction::is_removed(&module_dir) {
++                return Ok(());
+             }
+-            rename(updated_module, &module_dir)?;
+-            if removed {
+-                let path = module_dir.join(defs::REMOVE_FILE_NAME);
+-                if let Err(e) = ensure_file_exists(&path) {
+-                    warn!("Failed to create {}: {e}", path.display());
+-                }
+-            } else if disabled {
+-                let path = module_dir.join(defs::DISABLE_FILE_NAME);
+-                if let Err(e) = ensure_file_exists(&path) {
+-                    warn!("Failed to create {}: {e}", path.display());
+-                }
++            if module_dir.join(defs::DISABLE_FILE_NAME).exists() {
++                ensure_file_exists(updated_module.join(defs::DISABLE_FILE_NAME))?;
+             }
++            if module_dir.exists() { remove_dir_all(&module_dir)?; }
++            rename(updated_module, &module_dir)?;
++            Ok(())
++        })();
++        if let Err(error) = result {
++            warn!("Failed to update module {id}: {error:#}");
++            if first_error.is_none() { first_error = Some(error); }
+         }
+         Ok(())
+     })?;
++    if let Some(error) = first_error { return Err(error); }
+     Ok(())
+ }
+ 
+@@ -778,31 +775,7 @@ fn install_module_to_system(zip: &str) -> Result<String> {
+     if is_metamodule {
+         info!("Installing metamodule: {module_id}");
+ 
+-        // Check if there's already a metamodule installed
+-        if metamodule::has_metamodule()
+-            && let Some(existing_path) = metamodule::get_metamodule_path()
+-        {
+-            let existing_id = read_module_prop(&existing_path)
+-                .ok()
+-                .and_then(|m| m.get("id").cloned())
+-                .unwrap_or_else(|| "unknown".to_string());
+-
+-            if existing_id != module_id {
+-                println!("\n❌ Installation Failed");
+-                println!("┌────────────────────────────────");
+-                println!("│ A metamodule is already installed");
+-                println!("│   Current metamodule: {existing_id}");
+-                println!("│");
+-                println!("│ Only one metamodule can be active at a time.");
+-                println!("│");
+-                println!("│ To install this metamodule:");
+-                println!("│   1. Uninstall the current metamodule");
+-                println!("│   2. Reboot your device");
+-                println!("│   3. Install the new metamodule");
+-                println!("└─────────────────────────────────\n");
+-                bail!("Cannot install multiple metamodules");
+-            }
+-        }
++        ensure_unique_metamodule(module_id)?;
+     }
+ 
+     let zip_uncompressed_size = get_zip_uncompressed_size(zip)?;
+@@ -846,9 +819,10 @@ fn install_module_to_system(zip: &str) -> Result<String> {
+     exec_install_script(zip, is_metamodule, module_id, &transaction.temporary_dir())?;
+     transaction.publish_metadata(is_metamodule)?;
+     transaction.commit()?;
++    let metadata_guard = transaction.take_metadata_guard();
+ 
+     if let Some(request) = hot_install::take_request(&updated_dir)
+-        && hot_install::apply(module_id, is_metamodule, &request)
++        && hot_install::apply(module_id, is_metamodule, &request, metadata_guard)
+     {
+         println!("- Module installed successfully, no reboot required!");
+         info!("Module {module_id} installed successfully!");
+@@ -861,6 +835,39 @@ fn install_module_to_system(zip: &str) -> Result<String> {
+     Ok(module_id.to_owned())
+ }
+ 
++pub(super) fn duplicate_metamodule_error(existing_id: &str) -> Result<()> {
++    println!("\n❌ Installation Failed");
++    println!("┌────────────────────────────────");
++    println!("│ A metamodule is already installed");
++    println!("│   Current metamodule: {existing_id}");
++    println!("│");
++    println!("│ Only one metamodule can be active at a time.");
++    println!("│");
++    println!("│ To install this metamodule:");
++    println!("│   1. Uninstall the current metamodule");
++    println!("│   2. Reboot your device");
++    println!("│   3. Install the new metamodule");
++    println!("└─────────────────────────────────\n");
++    bail!("Cannot install multiple metamodules");
++}
++
++pub(super) fn ensure_unique_metamodule(module_id: &str) -> Result<()> {
++    // Check if there's already a metamodule installed
++    if metamodule::has_metamodule()
++        && let Some(existing_path) = metamodule::get_metamodule_path()
++    {
++        let existing_id = read_module_prop(&existing_path)
++            .ok()
++            .and_then(|m| m.get("id").cloned())
++            .unwrap_or_else(|| "unknown".to_string());
++
++        if existing_id != module_id {
++            return duplicate_metamodule_error(&existing_id);
++        }
++    }
++    Ok(())
++}
++
+ pub fn install_module(zip: &str) -> Result<()> {
+     ksucalls::ensure_uapi_version_matched()?;
+ 
+@@ -878,44 +885,40 @@ pub fn install_module(zip: &str) -> Result<()> {
+ 
+ pub fn undo_uninstall_module(id: &str) -> Result<()> {
+     validate_module_id(id)?;
+-
+-    let module_path = Path::new(defs::MODULE_DIR).join(id);
+-    ensure!(module_path.exists(), "Module {id} not found");
+-
+-    // Remove the remove mark
+-    let remove_file = module_path.join(defs::REMOVE_FILE_NAME);
+-    if remove_file.exists() {
+-        std::fs::remove_file(&remove_file)
+-            .with_context(|| format!("Failed to delete remove file for module '{id}'"))?;
+-        info!("Removed the remove mark for module {id}");
++    {
++        let _lock = install_transaction::mutation_lock(id, true)?
++            .context("Missing module mutation lock")?;
++        let _metadata = metadata_lock(id)?;
++        let module_path = Path::new(defs::MODULE_DIR).join(id);
++        ensure!(module_path.exists(), "Module {id} not found");
++        removal_transaction::cancel(id)?;
+     }
+-
++    info!("Removed the remove mark for module {id}");
+     if let Err(e) = regenerate_preinit() {
+         warn!("regenerate preinit failed: {e:#}");
+     }
+-
+     Ok(())
+ }
+ 
+ pub fn uninstall_module(id: &str) -> Result<()> {
+-    validate_module_id(id)?;
+-
+-    let module_path = Path::new(defs::MODULE_DIR).join(id);
+-    ensure!(module_path.exists(), "Module {id} not found");
+-
+-    // Mark for removal
+-    let remove_file = module_path.join(defs::REMOVE_FILE_NAME);
+-    File::create(remove_file).with_context(|| "Failed to create remove file")?;
+-
++    mark_module_for_removal(id)?;
+     info!("Module {id} marked for removal");
+-
+     if let Err(e) = regenerate_preinit() {
+         warn!("regenerate preinit failed: {e:#}");
+     }
+-
+     Ok(())
+ }
+ 
++fn mark_module_for_removal(id: &str) -> Result<()> {
++    validate_module_id(id)?;
++    let _lock = install_transaction::mutation_lock(id, true)?
++        .context("Missing module mutation lock")?;
++    let _metadata = metadata_lock(id)?;
++    let module_path = Path::new(defs::MODULE_DIR).join(id);
++    ensure!(module_path.exists(), "Module {id} not found");
++    removal_transaction::mark(id).context("Failed to create remove file")
++}
++
+ pub fn run_action(id: &str) -> Result<()> {
+     validate_module_id(id)?;
+     ksucalls::ensure_uapi_version_matched()?;
+@@ -927,15 +930,18 @@ pub fn run_action(id: &str) -> Result<()> {
+ pub fn enable_module(id: &str) -> Result<()> {
+     validate_module_id(id)?;
+ 
+-    let module_path = Path::new(defs::MODULE_DIR).join(id);
+-    ensure!(module_path.exists(), "Module {id} not found");
+-
+-    let disable_path = module_path.join(defs::DISABLE_FILE_NAME);
+-    if disable_path.exists() {
+-        std::fs::remove_file(&disable_path).with_context(|| {
+-            format!("Failed to remove disable file: {}", disable_path.display())
+-        })?;
+-        info!("Module {id} enabled");
++    {
++        let _metadata = metadata_lock(id)?;
++        let module_path = Path::new(defs::MODULE_DIR).join(id);
++        ensure!(module_path.exists(), "Module {id} not found");
++
++        let disable_path = module_path.join(defs::DISABLE_FILE_NAME);
++        if disable_path.exists() {
++            std::fs::remove_file(&disable_path).with_context(|| {
++                format!("Failed to remove disable file: {}", disable_path.display())
++            })?;
++            info!("Module {id} enabled");
++        }
+     }
+ 
+     if let Err(e) = regenerate_preinit() {
+@@ -946,11 +952,15 @@ pub fn enable_module(id: &str) -> Result<()> {
+ }
+ 
+ pub fn disable_module(id: &str) -> Result<()> {
+-    let module_path = Path::new(defs::MODULE_DIR).join(id);
+-    ensure!(module_path.exists(), "Module {id} not found");
++    validate_module_id(id)?;
++    {
++        let _metadata = metadata_lock(id)?;
++        let module_path = Path::new(defs::MODULE_DIR).join(id);
++        ensure!(module_path.exists(), "Module {id} not found");
+ 
+-    let disable_path = module_path.join(defs::DISABLE_FILE_NAME);
+-    ensure_file_exists(disable_path)?;
++        let disable_path = module_path.join(defs::DISABLE_FILE_NAME);
++        ensure_file_exists(disable_path)?;
++    }
+ 
+     info!("Module {id} disabled");
+ 
+@@ -962,33 +972,50 @@ pub fn disable_module(id: &str) -> Result<()> {
+ }
+ 
+ pub fn disable_all_modules() -> Result<()> {
+-    mark_all_modules(defs::DISABLE_FILE_NAME)?;
++    let result = mark_all_modules(defs::DISABLE_FILE_NAME);
+     if let Err(e) = regenerate_preinit() {
+         warn!("regenerate preinit failed: {e:#}");
+     }
+-    Ok(())
++    result
+ }
+ 
+ pub fn uninstall_all_modules() -> Result<()> {
+     info!("Uninstalling all modules");
+-    mark_all_modules(defs::REMOVE_FILE_NAME)?;
++    let result = mark_all_modules(defs::REMOVE_FILE_NAME);
+     if let Err(e) = regenerate_preinit() {
+         warn!("regenerate preinit failed: {e:#}");
+     }
+-    Ok(())
++    result
+ }
+ 
+ fn mark_all_modules(flag_file: &str) -> Result<()> {
+     // we assume the module dir is already mounted
+     let dir = std::fs::read_dir(defs::MODULE_DIR)?;
+-    for entry in dir.flatten() {
+-        let path = entry.path();
+-        let flag = path.join(flag_file);
+-        if let Err(e) = ensure_file_exists(flag) {
+-            warn!("Failed to mark module: {}: {e}", path.display());
++    let mut first_error = None;
++    for entry in dir {
++        let result = (|| -> Result<()> {
++            let entry = entry?;
++            if !entry.file_type()?.is_dir() { return Ok(()); }
++            let name = entry.file_name();
++            let id = name.to_str().context("Invalid module directory name")?;
++            validate_module_id(id)?;
++            if flag_file == defs::REMOVE_FILE_NAME {
++                mark_module_for_removal(id)?;
++            } else {
++                let _metadata = metadata_lock(id)?;
++                let path = Path::new(defs::MODULE_DIR).join(id);
++                ensure!(path.is_dir(), "Module {id} not found");
++                ensure_file_exists(path.join(flag_file))
++                    .with_context(|| format!("Failed to mark module {id}"))?;
++            }
++            Ok(())
++        })();
++        if let Err(error) = result {
++            warn!("Failed to mark modules {flag_file}: {error:#}");
++            if first_error.is_none() { first_error = Some(error); }
+         }
+     }
+-
++    if let Some(error) = first_error { return Err(error); }
+     Ok(())
+ }
+ 
+@@ -1115,7 +1142,7 @@ fn list_module(path: &str) -> Vec<HashMap<String, String>> {
+         // Add enabled, update, remove, web, action flags
+         let enabled = !path.join(defs::DISABLE_FILE_NAME).exists();
+         let update = path.join(defs::UPDATE_FILE_NAME).exists();
+-        let remove = path.join(defs::REMOVE_FILE_NAME).exists();
++        let remove = removal_transaction::is_removed(&path);
+         let web = path.join(defs::MODULE_WEB_DIR).exists();
+         let action = path.join(defs::MODULE_ACTION_SH).exists();
+         let need_mount = path.join("system").exists() && !path.join("skip_mount").exists();
+@@ -1170,7 +1197,8 @@ fn list_module(path: &str) -> Vec<HashMap<String, String>> {
+ }
+ 
+ pub fn list_modules() -> Result<()> {
+-    let modules = list_module(defs::MODULE_DIR);
++    let mut modules = list_module(defs::MODULE_DIR);
++    removal_transaction::append_pending_rows(&mut modules)?;
+     println!("{}", serde_json::to_string_pretty(&modules)?);
+     Ok(())
+ }
+diff --git a/userspace/ksud/src/module_install_transaction.rs b/userspace/ksud/src/module_install_transaction.rs
+index 3eca9d0..203a785 100644
+--- a/userspace/ksud/src/module_install_transaction.rs
++++ b/userspace/ksud/src/module_install_transaction.rs
+@@ -1,15 +1,17 @@
+-use crate::{defs, metamodule, utils::{ensure_dir_exists, ensure_file_exists}};
++use crate::{defs, utils::{ensure_dir_exists, ensure_file_exists}};
+ use anyhow::{Context, Result, bail, ensure};
+ use serde_json::{Value, json};
+ use std::{
+     fs::{self, DirBuilder, File, OpenOptions},
+     io::{self, Read, Write},
+-    os::{fd::AsRawFd, unix::fs::{DirBuilderExt, OpenOptionsExt}},
++    os::{fd::AsRawFd, unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt}},
+     path::{Path, PathBuf},
+ };
+ 
+ pub(super) struct InstallTransaction {
+     directory: PathBuf,
++    publication_guard: Option<MetamodulePublication>,
++    metadata_guard: Option<File>,
+     _lock: File,
+     record: Value,
+     committed: bool,
+@@ -75,6 +77,8 @@ fn private_root() -> Result<PathBuf> {
+ }
+ 
+ fn lock(module_id: &str, wait: bool) -> Result<Option<File>> {
++    let held = std::env::var("KSUD_REMOVAL_CALLBACK_IDS").unwrap_or_default();
++    let wait = wait && !held.split(':').any(|id| id == module_id);
+     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+         .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+         .open(private_root()?.join(format!(".lock-{module_id}")))?;
+@@ -93,12 +97,210 @@ fn lock(module_id: &str, wait: bool) -> Result<Option<File>> {
+     }
+ }
+ 
++pub(super) fn metadata_lock(module_id: &str) -> Result<File> {
++    super::validate_module_id(module_id)?;
++    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
++        .mode(0o600).custom_flags(libc::O_NOFOLLOW)
++        .open(private_root()?.join(format!(".metadata-lock-{module_id}")))?;
++    loop {
++        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
++            return Ok(file);
++        }
++        let error = io::Error::last_os_error();
++        if error.kind() != io::ErrorKind::Interrupted {
++            return Err(error.into());
++        }
++    }
++}
++
++pub(super) struct MetamodulePublication {
++    _lock: File,
++}
++
++fn metamodule_path() -> &'static Path {
++    Path::new(defs::METAMODULE_DIR.trim_end_matches('/'))
++}
++
++pub(super) fn validate_metamodule_state(state: &Value) -> Result<()> {
++    if state.is_null() { return Ok(()); }
++    ensure!(state["dev"].is_u64() && state["ino"].is_u64()
++        && matches!(state["kind"].as_str(), Some("symlink" | "directory")),
++        "Invalid metamodule resource identity");
++    ensure!(if state["kind"] == "symlink" { state["target"].is_string() }
++        else { state["target"].is_null() }, "Invalid metamodule resource target");
++    Ok(())
++}
++
++pub(super) fn validate_metamodule_owner(owner: &Value) -> Result<()> {
++    if owner.is_null() { return Ok(()); }
++    ensure!(owner["version"] == 1 && owner["generation"].as_str().is_some_and(|value|
++        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
++        "Invalid metamodule publication owner");
++    ensure!(owner.as_object().is_some_and(|owner| owner.contains_key("state")),
++        "Missing metamodule owner state");
++    validate_metamodule_state(&owner["state"])
++}
++
++fn metamodule_state(path: &Path) -> Result<Value> {
++    let metadata = match fs::symlink_metadata(path) {
++        Ok(metadata) => metadata,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Value::Null),
++        Err(error) => return Err(error.into()),
++    };
++    let (kind, target) = if metadata.file_type().is_symlink() {
++        ("symlink", Value::String(fs::read_link(path)?.into_os_string().into_string()
++            .map_err(|_| anyhow::anyhow!("Invalid metamodule link encoding"))?))
++    } else {
++        ensure!(metadata.is_dir(), "Invalid metamodule resource type");
++        ("directory", Value::Null)
++    };
++    Ok(json!({"kind":kind,"target":target,"dev":metadata.dev(),"ino":metadata.ino()}))
++}
++
++impl MetamodulePublication {
++    pub(super) fn lock() -> Result<Self> {
++        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
++            .mode(0o600).custom_flags(libc::O_NOFOLLOW)
++            .open(private_root()?.join(".metamodule-lock"))?;
++        loop {
++            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
++                return Ok(Self { _lock: file });
++            }
++            let error = io::Error::last_os_error();
++            if error.kind() != io::ErrorKind::Interrupted { return Err(error.into()); }
++        }
++    }
++
++    fn ensure_available(&self, module_id: &str) -> Result<()> {
++        let current = self.current()?;
++        let owner = self.owner()?;
++        ensure!(owner.is_null() || owner["state"] == current,
++            "Metamodule resource changed outside publication");
++        if owner["state"]["kind"] == "symlink" {
++            let target = Path::new(owner["state"]["target"].as_str().context("Missing metamodule owner target")?);
++            let resolved = if target.is_absolute() { target.to_path_buf() } else {
++                metamodule_path().parent().context("Missing metamodule parent")?.join(target)
++            };
++            if resolved != Path::new(defs::MODULE_DIR).join(module_id) {
++                let existing_id = resolved.file_name().and_then(|id| id.to_str()).unwrap_or("unknown");
++                return super::duplicate_metamodule_error(existing_id);
++            }
++        }
++        super::ensure_unique_metamodule(module_id)
++    }
++
++    pub(super) fn current(&self) -> Result<Value> {
++        metamodule_state(metamodule_path())
++    }
++
++    pub(super) fn owner(&self) -> Result<Value> {
++        let file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
++            .open(root().join(".metamodule-owner.json"))
++        {
++            Ok(file) => file,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Value::Null),
++            Err(error) => return Err(error.into()),
++        };
++        let owner: Value = serde_json::from_reader(file)?;
++        validate_metamodule_owner(&owner)?;
++        Ok(owner)
++    }
++
++    pub(super) fn set_owner(&self, generation: &Value, state: &Value) -> Result<()> {
++        let owner = json!({"version":1,"generation":generation,"state":state});
++        validate_metamodule_owner(&owner)?;
++        let temporary = root().join(".metamodule-owner.tmp");
++        let mut file = OpenOptions::new().write(true).create(true).truncate(true)
++            .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temporary)?;
++        serde_json::to_writer(&mut file, &owner)?;
++        file.sync_all()?;
++        fs::rename(temporary, root().join(".metamodule-owner.json"))?;
++        sync_dir(&root())
++    }
++
++    pub(super) fn unlink(&self, expected: &Value) -> Result<()> {
++        ensure!(self.current()? == *expected, "Metamodule resource changed before removal");
++        if !expected.is_null() { remove_entry(metamodule_path())?; }
++        sync_dir(Path::new(defs::ADB_DIR))
++    }
++}
++
++fn has_metamodule_publication(record: &Value) -> bool {
++    !record["metamodulePublication"].is_null()
++        || record["entries"].as_array().is_some_and(|entries| entries.iter().any(|entry|
++            entry["name"] == "metamodule"))
++}
++
++fn restore_metamodule(directory: &Path, record: &Value, guard: &MetamodulePublication) -> Result<()> {
++    let plan = &record["metamodulePublication"];
++    let owner = guard.owner()?;
++    if owner["generation"] != record["generation"] { return Ok(()); }
++    let current = guard.current()?;
++    let before = &plan["before"];
++    let after = &plan["after"];
++    let saved = directory.join("metamodule-backup");
++    let backup = metamodule_state(&saved)?;
++    if owner["state"] == *before {
++        ensure!(current == *before, "Restored metamodule resource changed");
++        return Ok(());
++    }
++    ensure!(owner["state"] == *after, "Metamodule publication owner changed");
++    ensure!(current.is_null() || current == *before || current == *after,
++        "Metamodule resource changed during installation rollback");
++    if current == *before {
++        ensure!(backup.is_null(), "Ambiguous metamodule rollback backup");
++    } else {
++        ensure!(backup == *before, "Metamodule rollback backup changed");
++        if !current.is_null() { guard.unlink(after)?; }
++        if !before.is_null() {
++            fs::rename(&saved, metamodule_path())?;
++            sync_dir(Path::new(defs::ADB_DIR))?;
++            sync_dir(directory)?;
++        }
++    }
++    sync_dir(Path::new(defs::ADB_DIR))?;
++    sync_dir(directory)?;
++    // Keep this generation even after restoration, so older recovery never revives it.
++    guard.set_owner(&record["generation"], before)
++}
++
++fn restore_legacy_metamodule(directory: &Path, record: &Value, index: usize,
++    entry: &Value, guard: &MetamodulePublication) -> Result<()>
++{
++    let saved = directory.join(format!("entry-{index}"));
++    let backup = metamodule_state(&saved)?;
++    let current = guard.current()?;
++    let owner = guard.owner()?;
++    if !owner.is_null() {
++        if owner["generation"] != record["generation"] { return Ok(()); }
++        if current == owner["state"] && backup.is_null() {
++            sync_dir(Path::new(defs::ADB_DIR))?;
++            return sync_dir(directory);
++        }
++        ensure!(current.is_null() && backup == owner["state"],
++            "Legacy metamodule restoration changed");
++    } else {
++        ensure!(!backup.is_null() || entry["existed"] == false,
++            "Legacy metamodule rollback target unconfirmed");
++        ensure!(current.is_null(), "Legacy metamodule publication outcome unconfirmed");
++        if backup.is_null() { guard.unlink(&Value::Null)?; }
++        guard.set_owner(&record["generation"], &backup)?;
++    }
++    if !backup.is_null() {
++        fs::rename(&saved, metamodule_path())?;
++        sync_dir(Path::new(defs::ADB_DIR))?;
++        sync_dir(directory)?;
++    }
++    Ok(())
++}
++
+ fn metadata_path(module_id: &str, name: &str) -> Result<PathBuf> {
+     match name {
+         "module.prop" | "update" | "remove" | "disable" | ".ksu_hot_install" => {
+             Ok(Path::new(defs::MODULE_DIR).join(module_id).join(name))
+         }
+         "metamodule" => Ok(PathBuf::from(defs::METAMODULE_DIR.trim_end_matches('/'))),
++        "remove-intent" => Ok(root().join(format!(".remove-{module_id}.json"))),
+         _ => bail!("Invalid installation metadata entry"),
+     }
+ }
+@@ -123,10 +325,23 @@ fn read_record(directory: &Path, module_id: &str) -> Result<Option<Value>> {
+         metadata_path(module_id, entry["name"].as_str().context("Missing entry name")?)?;
+         ensure!(entry["existed"].is_boolean(), "Invalid metadata intent");
+     }
++    if !record["metamodulePublication"].is_null() {
++        let plan = &record["metamodulePublication"];
++        ensure!(plan.as_object().is_some_and(|plan|
++            ["oldOwner", "before", "after"].iter().all(|key| plan.contains_key(*key))),
++            "Invalid metamodule publication intent");
++        validate_metamodule_owner(&plan["oldOwner"])?;
++        validate_metamodule_state(&plan["before"])?;
++        validate_metamodule_state(&plan["after"])?;
++        ensure!(plan["after"]["kind"] == "symlink"
++            && plan["after"]["target"].as_str().map(Path::new)
++                == Some(Path::new(defs::MODULE_DIR).join(module_id).as_path()),
++            "Invalid metamodule publication target");
++    }
+     Ok(Some(record))
+ }
+ 
+-fn restore(directory: &Path, record: &Value) -> Result<()> {
++fn restore(directory: &Path, record: &Value, publication: Option<&MetamodulePublication>) -> Result<()> {
+     let module_id = record["id"].as_str().context("Missing module identity")?;
+     let pending = Path::new(defs::MODULE_UPDATE_DIR).join(module_id);
+     let old_pending = directory.join("pending");
+@@ -139,8 +354,16 @@ fn restore(directory: &Path, record: &Value) -> Result<()> {
+         remove_entry(&pending)?;
+         sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
+     }
++    if !record["metamodulePublication"].is_null() {
++        restore_metamodule(directory, record, publication.context("Missing metamodule publication guard")?)?;
++    }
+     let entries = record["entries"].as_array().context("Missing metadata intents")?;
+     for (index, entry) in entries.iter().enumerate().rev() {
++        if entry["name"] == "metamodule" {
++            restore_legacy_metamodule(directory, record, index, entry,
++                publication.context("Missing legacy metamodule publication guard")?)?;
++            continue;
++        }
+         let path = metadata_path(module_id, entry["name"].as_str().context("Missing entry name")?)?;
+         let saved = directory.join(format!("entry-{index}"));
+         if fs::symlink_metadata(&saved).is_ok() {
+@@ -165,10 +388,15 @@ fn restore(directory: &Path, record: &Value) -> Result<()> {
+ 
+ fn recover(directory: &Path, module_id: &str) -> Result<()> {
+     if !directory.try_exists()? { return Ok(()); }
++    let _metadata = metadata_lock(module_id)?;
+     let record = read_record(directory, module_id)?;
+     let rollback = record.as_ref().is_some_and(|record| record["phase"] != "committed");
+     if rollback {
+-        restore(directory, record.as_ref().context("Missing recovery record")?)?;
++        let record = record.as_ref().context("Missing recovery record")?;
++        let publication = if has_metamodule_publication(record) {
++            Some(MetamodulePublication::lock()?)
++        } else { None };
++        restore(directory, record, publication.as_ref())?;
+     }
+     fs::remove_dir_all(directory)?;
+     sync_dir(&root())?;
+@@ -199,13 +427,22 @@ pub(super) fn recover_before_boot() -> Result<()> {
+     Ok(())
+ }
+ 
++pub(super) fn mutation_lock(module_id: &str, wait: bool) -> Result<Option<File>> {
++    let Some(lock) = lock(module_id, wait)? else { return Ok(None); };
++    recover(&root().join(module_id), module_id)?;
++    Ok(Some(lock))
++}
++
+ pub(super) fn skip_uncommitted(path: &Path, pending: bool) -> bool {
+     let Some(module_id) = path.file_name().and_then(|name| name.to_str()) else {
+         return true;
+     };
+     match read_record(&root().join(module_id), module_id) {
+         Ok(Some(record)) => record["phase"] != "committed"
+-            && (pending || record["createdLive"] == true),
++            && (pending || record["createdLive"] == true
++                || record["entries"].as_array().is_some_and(|entries| entries.iter().any(|entry|
++                    entry["existed"] == true
++                        && matches!(entry["name"].as_str(), Some("remove" | "remove-intent"))))),
+         Ok(None) => false,
+         Err(error) => {
+             log::warn!("Module {module_id} installation state unreadable: {error:#}");
+@@ -230,7 +467,8 @@ impl InstallTransaction {
+         };
+         DirBuilder::new().mode(0o700).create(&directory)?;
+         let mut transaction = Self {
+-            directory, _lock: lock, committed: false, commit_visible: false, record_durable: false,
++            directory, _lock: lock, publication_guard: None, metadata_guard: None,
++            committed: false, commit_visible: false, record_durable: false,
+             record: json!({"version":1,"id":module_id,"generation":generation,
+                 "phase":"preparing","oldPending":pending_existed,"createdLive":false,"entries":[]}),
+         };
+@@ -284,6 +522,16 @@ impl InstallTransaction {
+ 
+     pub(super) fn publish_metadata(&mut self, is_metamodule: bool) -> Result<()> {
+         let module_id = self.record["id"].as_str().context("Missing module identity")?.to_owned();
++        if self.metadata_guard.is_none() {
++            self.metadata_guard = Some(metadata_lock(&module_id)?);
++        }
++        if is_metamodule {
++            sync_tree(&Path::new(defs::MODULE_UPDATE_DIR).join(&module_id))?;
++            sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++            self.publication_guard = Some(MetamodulePublication::lock()?);
++            self.publication_guard.as_ref().context("Missing metamodule publication guard")?
++                .ensure_available(&module_id)?;
++        }
+         let live = Path::new(defs::MODULE_DIR).join(&module_id);
+         self.record["createdLive"] = match fs::symlink_metadata(&live) {
+             Ok(_) => false.into(),
+@@ -293,7 +541,7 @@ impl InstallTransaction {
+         self.persist()?;
+         ensure_dir_exists(&live)?;
+         for name in ["module.prop", defs::UPDATE_FILE_NAME, defs::REMOVE_FILE_NAME,
+-            defs::DISABLE_FILE_NAME, defs::HOT_INSTALL_MARKER]
++            defs::DISABLE_FILE_NAME, defs::HOT_INSTALL_MARKER, "remove-intent"]
+         {
+             self.save_entry(name)?;
+         }
+@@ -302,9 +550,29 @@ impl InstallTransaction {
+         File::open(live.join("module.prop"))?.sync_all()?;
+         ensure_file_exists(live.join(defs::UPDATE_FILE_NAME))?;
+         if is_metamodule {
+-            self.save_entry("metamodule")?;
+-            metamodule::ensure_symlink(&live)?;
++            let guard = self.publication_guard.as_ref().context("Missing metamodule publication guard")?;
++            let before = guard.current()?;
++            let old_owner = guard.owner()?;
++            ensure!(old_owner.is_null() || old_owner["state"] == before,
++                "Metamodule resource changed outside publication");
++            let prepared = self.directory.join("metamodule-published");
++            std::os::unix::fs::symlink(&live, &prepared)?;
++            sync_dir(&self.directory)?;
++            let after = metamodule_state(&prepared)?;
++            self.record["metamodulePublication"] = json!({
++                "oldOwner":old_owner,"before":before,"after":after});
++            self.persist()?;
++            let guard = self.publication_guard.as_ref().context("Missing metamodule publication guard")?;
++            guard.set_owner(&self.record["generation"], &after)?;
++            ensure!(guard.current()? == before, "Metamodule resource changed before publication");
++            if !before.is_null() {
++                fs::rename(metamodule_path(), self.directory.join("metamodule-backup"))?;
++                sync_dir(Path::new(defs::ADB_DIR))?;
++                sync_dir(&self.directory)?;
++            }
++            fs::rename(&prepared, metamodule_path())?;
+             sync_dir(Path::new(defs::ADB_DIR))?;
++            sync_dir(&self.directory)?;
+         }
+         sync_dir(&live)?;
+         sync_dir(Path::new(defs::MODULE_DIR))?;
+@@ -312,14 +580,21 @@ impl InstallTransaction {
+     }
+ 
+     pub(super) fn commit(&mut self) -> Result<()> {
+-        sync_tree(&Path::new(defs::MODULE_UPDATE_DIR).join(
+-            self.record["id"].as_str().context("Missing module identity")?))?;
+-        sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++        if self.publication_guard.is_none() {
++            sync_tree(&Path::new(defs::MODULE_UPDATE_DIR).join(
++                self.record["id"].as_str().context("Missing module identity")?))?;
++            sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?;
++        }
+         self.record["phase"] = "committed".into();
+         self.persist()?;
+         self.committed = true;
++        drop(self.publication_guard.take());
+         Ok(())
+     }
++
++    pub(super) fn take_metadata_guard(&mut self) -> Option<File> {
++        self.metadata_guard.take()
++    }
+ }
+ 
+ impl Drop for InstallTransaction {
+@@ -333,8 +608,18 @@ impl Drop for InstallTransaction {
+             return;
+         }
+         if !self.committed {
+-            self.record["phase"] = "preparing".into();
+-            let result = self.persist().and_then(|()| restore(&self.directory, &self.record));
++            let result = (|| -> Result<()> {
++                if self.metadata_guard.is_none() {
++                    let id = self.record["id"].as_str().context("Missing module identity")?;
++                    self.metadata_guard = Some(metadata_lock(id)?);
++                }
++                if has_metamodule_publication(&self.record) && self.publication_guard.is_none() {
++                    self.publication_guard = Some(MetamodulePublication::lock()?);
++                }
++                self.record["phase"] = "preparing".into();
++                self.persist()?;
++                restore(&self.directory, &self.record, self.publication_guard.as_ref())
++            })();
+             if let Err(error) = result {
+                 let _ = writeln!(io::stderr(), "! Module rollback incomplete: {error:#}; retained {}", self.directory.display());
+                 return;
+diff --git a/userspace/ksud/src/module_removal_transaction.rs b/userspace/ksud/src/module_removal_transaction.rs
+new file mode 100644
+index 0000000..a706835
+--- /dev/null
++++ b/userspace/ksud/src/module_removal_transaction.rs
+@@ -0,0 +1,388 @@
++use crate::{defs, metamodule, utils::ensure_file_exists};
++use anyhow::{Context, Result, bail, ensure};
++use serde_json::{Value, json};
++use std::{
++    collections::{BTreeSet, HashMap},
++    fs::{self, File, OpenOptions},
++    io::{self, Read},
++    os::unix::fs::{MetadataExt, OpenOptionsExt},
++    path::{Path, PathBuf},
++};
++
++fn root() -> PathBuf {
++    Path::new(defs::WORKING_DIR).join(".module-install")
++}
++
++fn intent_path(module_id: &str) -> PathBuf {
++    root().join(format!(".remove-{module_id}.json"))
++}
++
++fn sync_dir(path: &Path) -> Result<()> {
++    File::open(path)?.sync_all()?;
++    Ok(())
++}
++
++fn identity(path: &Path) -> Result<Option<[u64; 2]>> {
++    match fs::symlink_metadata(path) {
++        Ok(metadata) => Ok(Some([metadata.dev(), metadata.ino()])),
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
++        Err(error) => Err(error.into()),
++    }
++}
++
++fn valid_boot_id(value: &str) -> bool {
++    value.len() == 36 && value.bytes().enumerate().all(|(index, byte)| {
++        if matches!(index, 8 | 13 | 18 | 23) { byte == b'-' } else { byte.is_ascii_hexdigit() }
++    })
++}
++
++fn callback_boot_id() -> Result<String> {
++    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
++    let value = value.trim();
++    ensure!(valid_boot_id(value), "Invalid removal callback boot identity");
++    Ok(value.to_owned())
++}
++
++fn read_intent(module_id: &str) -> Result<Option<Value>> {
++    let bytes = match fs::read(intent_path(module_id)) {
++        Ok(bytes) => bytes,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
++        Err(error) => return Err(error.into()),
++    };
++    let record: Value = serde_json::from_slice(&bytes)?;
++    ensure!(record["version"] == 1 && record["id"] == module_id,
++        "Invalid removal transaction identity");
++    ensure!(record["generation"].as_str().is_some_and(|value|
++        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
++        "Invalid removal generation");
++    for key in ["live", "pending"] {
++        if !record[key].is_null() {
++            let parts = record[key].as_array().context("Invalid removal target identity")?;
++            ensure!(parts.len() == 2 && parts.iter().all(Value::is_u64),
++                "Invalid removal target identity");
++        }
++    }
++    ensure!(record["metamodule"].is_boolean(), "Invalid metamodule removal state");
++    ensure!(record["properties"].as_object().is_some_and(|properties|
++        properties.values().all(Value::is_string)), "Invalid removal module metadata");
++    for key in ["metaCallback", "ownCallback"] {
++        ensure!(matches!(record[key].as_str(), Some("pending" | "running" | "done")),
++            "Invalid removal callback phase");
++        for suffix in ["Boot", "InterruptedBoot"] {
++            let value = &record[format!("{key}{suffix}")];
++            ensure!(value.is_null() || value.as_str().is_some_and(valid_boot_id),
++                "Invalid removal callback boot identity");
++        }
++    }
++    if !record["metamoduleRemoval"].is_null() {
++        let plan = &record["metamoduleRemoval"];
++        ensure!(plan.as_object().is_some_and(|plan|
++            plan.contains_key("before") && plan.contains_key("owner")),
++            "Invalid metamodule removal intent");
++        super::install_transaction::validate_metamodule_state(&plan["before"])?;
++        super::install_transaction::validate_metamodule_owner(&plan["owner"])?;
++    }
++    Ok(Some(record))
++}
++
++fn matches_identity(record: &Value, current: Option<[u64; 2]>) -> bool {
++    current.is_none() || *record == json!(current)
++}
++
++pub(super) fn is_removed(module: &Path) -> bool {
++    if module.join(defs::REMOVE_FILE_NAME).exists() { return true; }
++    let Some(id) = module.file_name().and_then(|name| name.to_str()) else { return false; };
++    match read_intent(id) {
++        Ok(Some(_)) => true,
++        Ok(None) => false,
++        Err(error) => {
++            log::warn!("Module {id} removal state unreadable: {error:#}");
++            true
++        }
++    }
++}
++
++pub(super) fn pending_ids() -> Result<BTreeSet<String>> {
++    let mut ids = BTreeSet::new();
++    let entries = match fs::read_dir(root()) {
++        Ok(entries) => entries,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ids),
++        Err(error) => return Err(error.into()),
++    };
++    for entry in entries {
++        let entry = entry?;
++        let name = entry.file_name();
++        let Some(name) = name.to_str() else { continue; };
++        let Some(id) = name.strip_prefix(".remove-").and_then(|name| name.strip_suffix(".json")) else {
++            continue;
++        };
++        if let Err(error) = super::validate_module_id(id) {
++            log::warn!("Invalid removal intent name {name}: {error:#}");
++            continue;
++        }
++        ids.insert(id.to_owned());
++    }
++    Ok(ids)
++}
++
++pub(super) fn append_pending_rows(rows: &mut Vec<HashMap<String, String>>) -> Result<()> {
++    for id in pending_ids()? {
++        if rows.iter().any(|row| row.get("id") == Some(&id)) { continue; }
++        let record = match read_intent(&id) {
++            Ok(Some(record)) => record,
++            Ok(None) => continue,
++            Err(error) => {
++                log::warn!("Module {id} pending removal metadata unavailable: {error:#}");
++                continue;
++            }
++        };
++        let current = match identity(&Path::new(defs::MODULE_DIR).join(&id)) {
++            Ok(current) => current,
++            Err(error) => {
++                log::warn!("Module {id} pending removal target unavailable: {error:#}");
++                continue;
++            }
++        };
++        if !matches_identity(&record["live"], current) {
++            continue;
++        }
++        let mut row: HashMap<String, String> = serde_json::from_value(record["properties"].clone())?;
++        row.insert("id".into(), id);
++        for (key, value) in [("remove", "true"), ("enabled", "false"), ("update", "false"),
++            ("web", "false"), ("action", "false"), ("mount", "false")]
++        {
++            row.insert(key.into(), value.into());
++        }
++        rows.push(row);
++    }
++    Ok(())
++}
++
++pub(super) fn mark(module_id: &str) -> Result<()> {
++    let mut removal = Removal::open(module_id, true)?.context("Missing removal transaction")?;
++    removal.check_targets()?;
++    removal.persist()?;
++    let live = Path::new(defs::MODULE_DIR).join(module_id);
++    let marker = live.join(defs::REMOVE_FILE_NAME);
++    ensure_file_exists(&marker)?;
++    File::open(marker)?.sync_all()?;
++    sync_dir(&live)
++}
++
++pub(super) fn cancel(module_id: &str) -> Result<()> {
++    let live = Path::new(defs::MODULE_DIR).join(module_id);
++    if let Some(record) = read_intent(module_id)? {
++        ensure!(matches_identity(&record["live"], identity(&live)?),
++            "Removal target changed for module {module_id}");
++        ensure!(record["metaCallback"] == "pending" && record["ownCallback"] == "pending",
++            "Removal already started for module {module_id}: metaCallback={} ownCallback={}",
++            record["metaCallback"], record["ownCallback"]);
++    }
++    match fs::remove_file(live.join(defs::REMOVE_FILE_NAME)) {
++        Ok(()) => sync_dir(&live)?,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++        Err(error) => return Err(error.into()),
++    }
++    match fs::remove_file(intent_path(module_id)) {
++        Ok(()) => sync_dir(&root())?,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++        Err(error) => return Err(error.into()),
++    }
++    Ok(())
++}
++
++pub(super) struct Removal {
++    record: Value,
++}
++
++impl Removal {
++    pub(super) fn open(module_id: &str, create: bool) -> Result<Option<Self>> {
++        if let Some(record) = read_intent(module_id)? { return Ok(Some(Self { record })); }
++        let live = Path::new(defs::MODULE_DIR).join(module_id);
++        if !create && !live.join(defs::REMOVE_FILE_NAME).exists() { return Ok(None); }
++        let mut random = [0u8; 16];
++        File::open("/dev/urandom")?.read_exact(&mut random)?;
++        let generation: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
++        let properties = super::read_module_prop(&live).unwrap_or_default();
++        let mut removal = Self { record: json!({
++            "version":1,"id":module_id,"generation":generation,
++            "live":identity(&live)?,
++            "pending":identity(&Path::new(defs::MODULE_UPDATE_DIR).join(module_id))?,
++            "metamodule":metamodule::is_metamodule(&properties),
++            "properties":properties,
++            "metaCallback":"pending","ownCallback":"pending"
++        }) };
++        removal.persist()?;
++        Ok(Some(removal))
++    }
++
++    fn id(&self) -> Result<&str> {
++        self.record["id"].as_str().context("Missing removal module identity")
++    }
++
++    fn persist(&mut self) -> Result<()> {
++        let id = self.id()?;
++        if let Some(current) = read_intent(id)? {
++            ensure!(current["generation"] == self.record["generation"],
++                "Removal generation changed for module {id}");
++        }
++        let temporary = root().join(format!(".remove-{id}.tmp"));
++        let mut file = OpenOptions::new().write(true).create(true).truncate(true)
++            .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temporary)?;
++        serde_json::to_writer(&mut file, &self.record)?;
++        file.sync_all()?;
++        fs::rename(temporary, intent_path(id))?;
++        sync_dir(&root())
++    }
++
++    fn check_targets(&self) -> Result<()> {
++        let id = self.id()?;
++        for (key, directory) in [("live", defs::MODULE_DIR), ("pending", defs::MODULE_UPDATE_DIR)] {
++            ensure!(matches_identity(&self.record[key], identity(&Path::new(directory).join(id))?),
++                "Removal {key} target changed for module {id}");
++        }
++        Ok(())
++    }
++
++    fn callback(&mut self, phase: &str, run: impl FnOnce() -> Result<()>) -> Result<()> {
++        match self.record[phase].as_str() {
++            Some("done") => return Ok(()),
++            Some("pending" | "running") => {}
++            _ => bail!("Invalid removal callback phase"),
++        }
++        let boot = callback_boot_id()?;
++        let boot_key = format!("{phase}Boot");
++        if self.record[phase] == "running" {
++            if let Some(previous) = self.record[&boot_key].as_str() {
++                ensure!(previous != boot,
++                    "Removal callback outcome unconfirmed for module {}: {phase}", self.id()?);
++                let previous = previous.to_owned();
++                log::warn!("Module {} removal callback interrupted in boot {previous}: {phase}; retrying", self.id()?);
++                self.record[format!("{phase}InterruptedBoot")] = previous.into();
++            } else {
++                // A legacy running record needs an observed boot boundary before replay.
++                self.record[&boot_key] = boot.into();
++                self.persist()?;
++                bail!("Removal callback outcome unconfirmed for module {}: {phase}", self.id()?);
++            }
++        }
++        self.record[phase] = "running".into();
++        self.record[&boot_key] = boot.into();
++        self.persist()?;
++        if let Err(error) = run() {
++            log::warn!("Module {} removal callback: {error:#}", self.id()?);
++        }
++        self.record[phase] = "done".into();
++        self.persist()
++    }
++
++    pub(super) fn run_callbacks(&mut self) -> Result<()> {
++        self.check_targets()?;
++        let id = self.id()?.to_owned();
++        let is_meta = self.record["metamodule"] == true;
++        self.callback("metaCallback", || {
++            if is_meta { Ok(()) } else { metamodule::exec_metauninstall_script(&id) }
++        })?;
++        let uninstaller = Path::new(defs::MODULE_DIR).join(&id).join("uninstall.sh");
++        self.callback("ownCallback", || {
++            if uninstaller.exists() {
++                super::exec_script_with(uninstaller, super::ScriptWait::Forever, |command| {
++                    command.env("KSUD_REMOVAL_CALLBACK_IDS", super::removal_callback_ancestry(&id));
++                })
++            } else { Ok(()) }
++        })
++    }
++
++    fn remove_metamodule(&mut self, live: &Path) -> Result<()> {
++        if self.record["metamodule"] != true { return Ok(()); }
++        let guard = super::install_transaction::MetamodulePublication::lock()?;
++        let current = guard.current()?;
++        let owner = guard.owner()?;
++        let generation = self.record["generation"].clone();
++        let existing = &self.record["metamoduleRemoval"];
++        if !existing.is_null() {
++            if owner["generation"] == generation {
++                ensure!(owner["state"].is_null(), "Metamodule removal owner changed");
++                ensure!(current.is_null() || current == existing["before"],
++                    "Metamodule resource changed during removal");
++                return guard.unlink(&current);
++            }
++            if owner != existing["owner"] { return Ok(()); }
++            ensure!(current == existing["before"], "Metamodule removal target changed");
++        } else {
++            if !current.is_null() {
++                if current["kind"] != "symlink" { return Ok(()); }
++                let target = Path::new(current["target"].as_str().context("Missing metamodule target")?);
++                let resolved = if target.is_absolute() { target.to_path_buf() } else {
++                    Path::new(defs::METAMODULE_DIR.trim_end_matches('/')).parent()
++                        .context("Missing metamodule parent")?.join(target)
++                };
++                if resolved != live { return Ok(()); }
++                ensure!(owner.is_null() || owner["state"] == current,
++                    "Metamodule resource changed outside publication");
++            } else if !owner["state"].is_null() {
++                if owner["state"]["kind"] != "symlink" { return Ok(()); }
++                let target = Path::new(owner["state"]["target"].as_str()
++                    .context("Missing metamodule owner target")?);
++                let resolved = if target.is_absolute() { target.to_path_buf() } else {
++                    Path::new(defs::METAMODULE_DIR.trim_end_matches('/')).parent()
++                        .context("Missing metamodule parent")?.join(target)
++                };
++                if resolved != live { return Ok(()); }
++            }
++            self.record["metamoduleRemoval"] = json!({"before":current,"owner":owner});
++            self.persist()?;
++        }
++        guard.set_owner(&generation, &Value::Null)?;
++        guard.unlink(&current)
++    }
++
++    pub(super) fn remove(mut self) -> Result<()> {
++        self.check_targets()?;
++        let id = self.id()?.to_owned();
++        let live = Path::new(defs::MODULE_DIR).join(&id);
++        let pending = Path::new(defs::MODULE_UPDATE_DIR).join(&id);
++        match fs::remove_dir_all(&pending) {
++            Ok(()) => sync_dir(Path::new(defs::MODULE_UPDATE_DIR))?,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => return Err(error).context("Failed to remove pending module"),
++        }
++        let config_result = crate::module_config::clear_module_configs(&id).and_then(|()| {
++            let directory = Path::new(defs::MODULE_CONFIG_DIR);
++            match fs::metadata(directory) {
++                Ok(_) => sync_dir(directory),
++                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
++                Err(error) => Err(error.into()),
++            }
++        });
++        let mut first_error = config_result.err();
++        if let Some(error) = &first_error {
++            log::warn!("Module {id} config cleanup: {error:#}");
++        }
++        let meta_result = self.remove_metamodule(&live);
++        if let Err(error) = meta_result {
++            log::warn!("Module {id} metamodule cleanup: {error:#}");
++            if first_error.is_none() { first_error = Some(error); }
++        }
++        let live_result = (|| -> Result<()> {
++            match fs::remove_dir_all(&live) {
++                Ok(()) => sync_dir(Path::new(defs::MODULE_DIR))?,
++                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++                Err(error) => return Err(error.into()),
++            }
++            Ok(())
++        })();
++        if let Err(error) = live_result {
++            log::warn!("Failed to remove live module {id}: {error:#}");
++            if first_error.is_none() { first_error = Some(error); }
++        }
++        if let Some(error) = first_error { return Err(error); }
++        let current = read_intent(&id)?.context("Removal intent disappeared before completion")?;
++        ensure!(current["generation"] == self.record["generation"],
++            "Removal generation changed before completion for module {id}");
++        fs::remove_file(intent_path(&id))?;
++        sync_dir(&root())?;
++        log::info!("Module {id} removed");
++        Ok(())
++    }
++}
